@@ -50,6 +50,8 @@ def cmd_repeat(args):
         if args.work_dir:
             worker_args += ['--work-dir', args.work_dir]
         worker_args.append(args.workflow_id)
+        if args.repeat_args:
+            worker_args += args.repeat_args
         submit_slurm('repeat', worker_args, args.batch_options or '')
     else:
         from sciunit_swarm.worker import WorkerAgent
@@ -59,6 +61,7 @@ def cmd_repeat(args):
             workflow_id=args.workflow_id,
             work_dir=args.work_dir,
             mode='repeat',
+            repeat_args=args.repeat_args or None,
         ).run()
 
 
@@ -103,6 +106,8 @@ def main():
     rep.add_argument('--batch-options', default=None, metavar='OPTS',
                      help='Extra options passed to sbatch, e.g. "--nodes=3 --time=01:00:00"')
     rep.add_argument('workflow_id', metavar='WORKFLOW_ID')
+    rep.add_argument('repeat_args', nargs='*', metavar='ARG',
+                     help='New args to substitute (keeps executable, replaces rest)')
     rep.set_defaults(func=cmd_repeat)
 
     args = parser.parse_args()

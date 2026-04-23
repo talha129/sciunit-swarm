@@ -89,13 +89,23 @@ sciunit-swarm controller run \
   --output ./swarm-packages
 ```
 
-**Terminal 2 — repeat workers (single-node):**
+**Terminal 2 — repeat workers (single-node, same cluster):**
 ```bash
 sciunit-swarm repeat \
   --controller-ip $(hostname) \
   --controller-port 9000 \
   <workflow-id>
 ```
+
+**Terminal 2 — repeat workers (single-node, new cluster with different manager host/port):**
+```bash
+sciunit-swarm repeat \
+  --controller-ip $(hostname) \
+  --controller-port 9000 \
+  <workflow-id> <new-manager-host> <new-manager-port>
+```
+
+The trailing arguments replace the original worker arguments (same executable, new args — following sciunit's substitution pattern). For example, if the original exec used `vine_worker old-host 9123`, providing `new-host 9123` replays as `vine_worker new-host 9123`.
 
 **Terminal 2 — repeat workers (SLURM):**
 ```bash
@@ -104,7 +114,7 @@ sciunit-swarm repeat \
   --controller-port 9000 \
   --batch-type slurm \
   --batch-options "--nodes=4 --ntasks-per-node=2 --time=01:00:00 --export=ALL,CONDA_ENV=my_env" \
-  <workflow-id>
+  <workflow-id> [new-manager-host new-manager-port]
 ```
 
 ## CLI Reference
@@ -130,6 +140,7 @@ sciunit-swarm repeat
   --batch-type {slurm}      Submit via batch scheduler
   --batch-options OPTS      Options passed to sbatch
   WORKFLOW_ID               ID printed by controller after exec phase
+  [ARG ...]                 New args to substitute (keeps executable, replaces rest)
 ```
 
 ## Output Layout
@@ -161,7 +172,11 @@ sciunit-swarm controller run \
   --manager "python3 examples/montecarlo_manager.py --tasks 20 --samples 1000000" \
   --port 9000
 
+# Repeat on same cluster
 sciunit-swarm repeat --controller-ip <head-node> --controller-port 9000 <workflow-id>
+
+# Repeat on new cluster (substitute manager host/port)
+sciunit-swarm repeat --controller-ip <new-head-node> --controller-port 9000 <workflow-id> <new-manager-host> <new-manager-port>
 ```
 
 ## Notes

@@ -15,6 +15,7 @@ repeat mode:
 """
 
 import io
+import json
 import os
 import select
 import shlex
@@ -34,13 +35,14 @@ from sciunit_swarm.protocol import send_json, recv_json, recv_exact
 class WorkerAgent:
     def __init__(self, controller_ip, controller_port,
                  worker_cmd=None, workflow_id=None, mode='exec',
-                 work_dir=None, listen_port=0):
+                 work_dir=None, listen_port=0, repeat_args=None):
         self.controller_ip   = controller_ip
         self.controller_port = controller_port
         self.worker_cmd      = worker_cmd
         self.workflow_id     = workflow_id
         self.mode            = mode
         self.work_dir        = work_dir
+        self.repeat_args     = repeat_args   # replaces args after executable at replay
         self.ptu_bin         = sciunit2.libexec.ptu.which
         self.node_id         = str(uuid.uuid4())[:8]
         self.host            = socket.gethostname()
@@ -68,6 +70,10 @@ class WorkerAgent:
 
         srv, port = self._start_listener()
         self._register(port, mode='exec')
+
+        os.makedirs(pkg_dir, exist_ok=True)
+        with open(os.path.join(pkg_dir, 'swarm.cmd'), 'w') as f:
+            json.dump(shlex.split(cmd), f)
 
         print(f"[worker {self.node_id}] exec: {cmd}")
         ptu_cmd = f"{self.ptu_bin} -o {pkg_dir} -- {cmd}"
@@ -107,7 +113,7 @@ class WorkerAgent:
             t.extractall(work_dir)
 
         pkg_dir = os.path.join(work_dir, 'cde-package')
-        proc = self._start_cde_log(pkg_dir)
+        proc = self._start_replay(pkg_dir)
 
         self._wait_for_kill(srv, proc)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -190,15 +196,23 @@ class WorkerAgent:
         conn.close()
         print(f"[worker {self.node_id}] container sent ({len(payload) // 1_048_576} MB)")
 
-    def _start_cde_log(self, pkg_dir):
-        cde_log = os.path.join(pkg_dir, 'cde.log')
-        if not os.path.exists(cde_log):
-            print(f"[worker {self.node_id}] no cde.log in {pkg_dir}")
+    def _start_replay(self, pkg_dir):
+        swarm_cmd = os.path.join(pkg_dir, 'swarm.cmd')
+        cde_exec  = os.path.join(pkg_dir, 'cde-exec')
+        cde_root  = os.path.join(pkg_dir, 'cde-root')
+        if not os.path.exists(swarm_cmd):
+            print(f"[worker {self.node_id}] no swarm.cmd in {pkg_dir}")
             return None
-        with open(cde_log) as f:
-            cmd = f.read().strip()
-        print(f"[worker {self.node_id}] replay: {cmd}")
-        return subprocess.Popen(cmd, shell=True, cwd=pkg_dir, start_new_session=True)
+        if not os.path.exists(cde_exec):
+            print(f"[worker {self.node_id}] no cde-exec in {pkg_dir}")
+            return None
+        with open(swarm_cmd) as f:
+            orig = json.load(f)
+        args = orig[:1] + self.repeat_args if self.repeat_args else orig
+        # mirrors vine_worker.cde: cd into cde-root, call ../cde-exec with current pkg_dir
+        cmd = [cde_exec, '-o', pkg_dir, '--'] + args
+        print(f"[worker {self.node_id}] replay: {shlex.join(cmd)}")
+        return subprocess.Popen(cmd, cwd=cde_root, start_new_session=True)
 
     def _wait_for_kill(self, srv, proc):
         print(f"[worker {self.node_id}] waiting for KILL signal...")
