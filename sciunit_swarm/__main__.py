@@ -5,7 +5,9 @@ sciunit-swarm — distributed workflow capture and replay.
 Usage:
   sciunit-swarm controller run --manager <cmd> [--port <port>] [--output <dir>]
   sciunit-swarm exec --controller-ip <ip> --controller-port <port> <worker-cmd>
-  sciunit-swarm repeat --controller-ip <ip> --controller-port <port> <workflow-id>
+  sciunit-swarm repeat --controller-ip <ip> --controller-port <port> <workflow-id> [args...]
+  sciunit-swarm push <workflow-id> [--output <dir>]
+  sciunit-swarm pull <url> [--output <dir>]
 """
 
 import argparse
@@ -65,6 +67,32 @@ def cmd_repeat(args):
         ).run()
 
 
+def cmd_push(args):
+    import os
+    from sciunit_swarm.s3 import push
+    tarball = os.path.join(args.output, args.workflow_id, 'unified.tar.gz')
+    if not os.path.isfile(tarball):
+        print(f'[push] error: {tarball} not found', file=sys.stderr)
+        sys.exit(1)
+    print(f'[push] uploading {tarball}...')
+    url = push(tarball, args.workflow_id)
+    print(f'[push] url: {url}')
+
+
+def cmd_pull(args):
+    import os
+    from sciunit_swarm.s3 import pull
+    print(f'[pull] downloading {args.url}...')
+    workflow_id = pull(args.url, args.output)
+    dest = os.path.join(args.output, workflow_id, 'unified.tar.gz')
+    print(f'[pull] workflow_id: {workflow_id}')
+    print(f'[pull] stored in:   {dest}')
+    print(f'[pull] repeat with:')
+    print(f'  sciunit-swarm repeat '
+          f'--controller-ip <host> --controller-port <port> '
+          f'{workflow_id} [new-args...]')
+
+
 def main():
     parser = argparse.ArgumentParser(prog='sciunit-swarm')
     sub = parser.add_subparsers(dest='command')
@@ -109,6 +137,20 @@ def main():
     rep.add_argument('repeat_args', nargs='*', metavar='ARG',
                      help='New args to substitute (keeps executable, replaces rest)')
     rep.set_defaults(func=cmd_repeat)
+
+    # --- push ---
+    psh = sub.add_parser('push', help='Upload unified container to S3, print URL')
+    psh.add_argument('workflow_id', metavar='WORKFLOW_ID')
+    psh.add_argument('--output', default='./swarm-packages', metavar='DIR',
+                     help='Directory where packages are stored (default: ./swarm-packages)')
+    psh.set_defaults(func=cmd_push)
+
+    # --- pull ---
+    pll = sub.add_parser('pull', help='Download unified container from S3 URL')
+    pll.add_argument('url', metavar='URL')
+    pll.add_argument('--output', default='./swarm-packages', metavar='DIR',
+                     help='Directory to store downloaded package (default: ./swarm-packages)')
+    pll.set_defaults(func=cmd_pull)
 
     args = parser.parse_args()
     if not hasattr(args, 'func'):

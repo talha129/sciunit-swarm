@@ -9,6 +9,6 @@ setup(
             'sciunit-swarm=sciunit_swarm.__main__:main',
         ],
     },
-    install_requires=['sciunit2'],
+    install_requires=['sciunit2', 'boto3', 'requests'],
     python_requires='>=3.6',
 )
