@@ -141,6 +141,14 @@ sciunit-swarm repeat
   --batch-options OPTS      Options passed to sbatch
   WORKFLOW_ID               ID printed by controller after exec phase
   [ARG ...]                 New args to substitute (keeps executable, replaces rest)
+
+sciunit-swarm push
+  WORKFLOW_ID               Workflow to upload
+  --output DIR              Directory where packages are stored (default: ./swarm-packages)
+
+sciunit-swarm pull
+  URL                       CloudFront URL printed by push
+  --output DIR              Directory to store downloaded package (default: ./swarm-packages)
 ```
 
 ## Output Layout
@@ -178,6 +186,26 @@ sciunit-swarm repeat --controller-ip <head-node> --controller-port 9000 <workflo
 # Repeat on new cluster (substitute manager host/port)
 sciunit-swarm repeat --controller-ip <new-head-node> --controller-port 9000 <workflow-id> <new-manager-host> <new-manager-port>
 ```
+
+## Sharing Workflows via S3
+
+After exec completes, push the unified container to S3 and share the URL with collaborators:
+
+```bash
+# Push to S3 (uses sciunit's credentials and bucket)
+sciunit-swarm push <workflow-id>
+# prints: [push] url: https://d3okuktvxs1y4w.cloudfront.net/projects/...
+
+# On another machine: pull and prepare for replay
+sciunit-swarm pull https://d3okuktvxs1y4w.cloudfront.net/projects/.../unified.tar.gz
+# prints: [pull] workflow_id: <workflow-id>
+# prints: [pull] repeat with: sciunit-swarm repeat --controller-ip <host> --controller-port <port> <workflow-id> [new-args...]
+
+# Then run the controller and repeat workers as usual
+sciunit-swarm repeat --controller-ip <host> --controller-port 9000 <workflow-id>
+```
+
+The workflow is stored under `projects/{timestamp}/{workflow_id}/unified.tar.gz` in the same S3 bucket as sciunit, so the same lifecycle policies apply. The original `workflow-id` is preserved through push/pull.
 
 ## Notes
 
