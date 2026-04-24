@@ -3,7 +3,8 @@
 sciunit-swarm — distributed workflow capture and replay.
 
 Usage:
-  sciunit-swarm controller run --manager <cmd> [--port <port>] [--output <dir>]
+  sciunit-swarm controller exec --manager <cmd> [--port <port>] [--output <dir>]
+  sciunit-swarm controller repeat <workflow-id> [--port <port>] [--output <dir>] [args...]
   sciunit-swarm exec --controller-ip <ip> --controller-port <port> <worker-cmd>
   sciunit-swarm repeat --controller-ip <ip> --controller-port <port> <workflow-id> [args...]
   sciunit-swarm push <workflow-id> [--output <dir>]
@@ -14,7 +15,7 @@ import argparse
 import sys
 
 
-def cmd_controller(args):
+def cmd_controller_exec(args):
     from sciunit_swarm.controller import Controller
     c = Controller(
         manager_cmd=args.manager,
@@ -22,6 +23,17 @@ def cmd_controller(args):
         output_dir=args.output,
     )
     c.run()
+
+
+def cmd_controller_repeat(args):
+    from sciunit_swarm.controller import Controller
+    c = Controller(
+        workflow_id=args.workflow_id,
+        port=args.port,
+        output_dir=args.output,
+        repeat_args=args.repeat_args or None,
+    )
+    c.repeat()
 
 
 def cmd_exec(args):
@@ -68,15 +80,12 @@ def cmd_repeat(args):
 
 
 def cmd_push(args):
-    import os
     from sciunit_swarm.s3 import push
-    tarball = os.path.join(args.output, args.workflow_id, 'unified.tar.gz')
-    if not os.path.isfile(tarball):
-        print(f'[push] error: {tarball} not found', file=sys.stderr)
-        sys.exit(1)
-    print(f'[push] uploading {tarball}...')
-    url = push(tarball, args.workflow_id)
-    print(f'[push] url: {url}')
+    print(f'[push] uploading workflow {args.workflow_id}...')
+    base_url = push(args.output, args.workflow_id)
+    print(f'[push] base url: {base_url}')
+    print(f'[push] pull with:')
+    print(f'  sciunit-swarm pull {base_url}')
 
 
 def cmd_pull(args):
@@ -84,13 +93,14 @@ def cmd_pull(args):
     from sciunit_swarm.s3 import pull
     print(f'[pull] downloading {args.url}...')
     workflow_id = pull(args.url, args.output)
-    dest = os.path.join(args.output, workflow_id, 'unified.tar.gz')
     print(f'[pull] workflow_id: {workflow_id}')
-    print(f'[pull] stored in:   {dest}')
-    print(f'[pull] repeat with:')
+    print(f'[pull] stored in:   {os.path.join(args.output, workflow_id)}/')
+    print(f'[pull] replay with:')
+    print(f'  sciunit-swarm controller repeat {workflow_id} '
+          f'--port <port> --output {args.output} [new-manager-args...]')
     print(f'  sciunit-swarm repeat '
           f'--controller-ip <host> --controller-port <port> '
-          f'{workflow_id} [new-args...]')
+          f'{workflow_id} [new-worker-args...]')
 
 
 def main():
@@ -100,14 +110,25 @@ def main():
     # --- controller ---
     ctl = sub.add_parser('controller', help='Run on head node')
     ctl_sub = ctl.add_subparsers(dest='ctl_command')
-    ctl_run = ctl_sub.add_parser('run', help='Launch manager and manage worker lifecycle')
-    ctl_run.add_argument('--manager', required=True, metavar='CMD',
-                         help='Manager command (e.g. "python3 manager.py")')
-    ctl_run.add_argument('--port', type=int, default=9000, metavar='PORT',
+
+    ctl_exec = ctl_sub.add_parser('exec', help='Capture manager + manage workers')
+    ctl_exec.add_argument('--manager', required=True, metavar='CMD',
+                          help='Manager command (e.g. "python3 manager.py")')
+    ctl_exec.add_argument('--port', type=int, default=9000, metavar='PORT',
+                          help='Controller listen port (default: 9000)')
+    ctl_exec.add_argument('--output', default='./swarm-packages', metavar='DIR',
+                          help='Directory to store captured packages (default: ./swarm-packages)')
+    ctl_exec.set_defaults(func=cmd_controller_exec)
+
+    ctl_rep = ctl_sub.add_parser('repeat', help='Replay captured manager + serve workers')
+    ctl_rep.add_argument('workflow_id', metavar='WORKFLOW_ID')
+    ctl_rep.add_argument('--port', type=int, default=9000, metavar='PORT',
                          help='Controller listen port (default: 9000)')
-    ctl_run.add_argument('--output', default='./swarm-packages', metavar='DIR',
-                         help='Directory to store captured packages (default: ./swarm-packages)')
-    ctl_run.set_defaults(func=cmd_controller)
+    ctl_rep.add_argument('--output', default='./swarm-packages', metavar='DIR',
+                         help='Directory where packages are stored (default: ./swarm-packages)')
+    ctl_rep.add_argument('repeat_args', nargs='*', metavar='ARG',
+                         help='New args to substitute into manager command')
+    ctl_rep.set_defaults(func=cmd_controller_repeat)
 
     # --- exec ---
     exc = sub.add_parser('exec', help='Run on compute node: capture worker under PTU')
@@ -139,17 +160,17 @@ def main():
     rep.set_defaults(func=cmd_repeat)
 
     # --- push ---
-    psh = sub.add_parser('push', help='Upload unified container to S3, print URL')
+    psh = sub.add_parser('push', help='Upload workflow containers to S3, print base URL')
     psh.add_argument('workflow_id', metavar='WORKFLOW_ID')
     psh.add_argument('--output', default='./swarm-packages', metavar='DIR',
                      help='Directory where packages are stored (default: ./swarm-packages)')
     psh.set_defaults(func=cmd_push)
 
     # --- pull ---
-    pll = sub.add_parser('pull', help='Download unified container from S3 URL')
+    pll = sub.add_parser('pull', help='Download workflow containers from S3 base URL')
     pll.add_argument('url', metavar='URL')
     pll.add_argument('--output', default='./swarm-packages', metavar='DIR',
-                     help='Directory to store downloaded package (default: ./swarm-packages)')
+                     help='Directory to store downloaded packages (default: ./swarm-packages)')
     pll.set_defaults(func=cmd_pull)
 
     args = parser.parse_args()

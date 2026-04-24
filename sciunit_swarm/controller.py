@@ -3,43 +3,56 @@
 Controller — runs on head node.
 
 exec phase:
+  - Launch manager under PTU capture
   - Accept REGISTER from workers (any count, any time)
-  - Launch manager command
   - When manager exits → KILL all registered workers
-  - Collect CONTAINER tarballs → build unified container → store as workflow_id
+  - Collect CONTAINER tarballs → build worker.tar.gz
+  - Tar manager capture → manager.tar.gz
 
 repeat phase:
-  - Accept REGISTER(workflow_id) from workers
-  - Push CONTAINER tarball to each worker
-  - Launch manager command
-  - When manager exits → KILL all registered workers
+  - Accept REGISTER(workflow_id) from workers → push worker.tar.gz to each
+  - Replay manager from manager.tar.gz via cde-exec
+  - When manager exits → KILL all repeat workers
 """
 
 import io
+import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 import uuid
 
+import sciunit2.libexec
 from sciunit_swarm.merge import build_unified_container
 from sciunit_swarm.protocol import send_json, recv_json, recv_exact
 
 
 class Controller:
-    def __init__(self, manager_cmd, port=9000, output_dir='./swarm-packages'):
-        self.manager_cmd = manager_cmd
-        self.port        = port
-        self.output_dir  = output_dir
-        self.host        = socket.gethostname()
+    def __init__(self, port=9000, output_dir='./swarm-packages',
+                 manager_cmd=None,
+                 workflow_id=None, repeat_args=None):
+        self.manager_cmd  = manager_cmd
+        self.port         = port
+        self.output_dir   = output_dir
+        self.workflow_id  = workflow_id
+        self.repeat_args  = repeat_args
+        self.host         = socket.gethostname()
+        self.ptu_bin      = sciunit2.libexec.ptu.which
 
-        self.workers        = {}        # node_id → (host, port)  exec workers
-        self.repeat_workers = {}        # node_id → (host, port)  repeat workers
+        self.workers        = {}
+        self.repeat_workers = {}
         self.workers_lock   = threading.Lock()
         self.stop_event     = threading.Event()
+
+    # ------------------------------------------------------------------
+    # Exec phase
+    # ------------------------------------------------------------------
 
     def run(self):
         workflow_id = str(uuid.uuid4())[:8]
@@ -50,34 +63,139 @@ class Controller:
         reg_thread = threading.Thread(target=self._registry_server, daemon=True)
         reg_thread.start()
 
-        self._run_manager()
+        mgr_work_dir, mgr_pkg_dir = self._run_manager_captured()
 
         self.stop_event.set()
         pkg_dirs = self._kill_and_collect(workflow_id)
 
+        os.makedirs(os.path.join(self.output_dir, workflow_id), exist_ok=True)
+
         if pkg_dirs:
-            out     = os.path.join(self.output_dir, workflow_id, 'unified')
-            tarball = os.path.join(self.output_dir, workflow_id, 'unified.tar.gz')
+            out            = os.path.join(self.output_dir, workflow_id, 'unified')
+            worker_tarball = os.path.join(self.output_dir, workflow_id, 'worker.tar.gz')
+
             t0 = time.time()
             build_unified_container(pkg_dirs, out)
             print(f"[controller] merge done ({time.time() - t0:.2f}s)")
 
-            print(f"[controller] compressing unified container...")
             t0 = time.time()
-            with tarfile.open(tarball, mode='w:gz') as t:
+            with tarfile.open(worker_tarball, 'w:gz') as t:
                 t.add(out, arcname='cde-package')
-            tarball_mb = os.path.getsize(tarball) / 1_048_576
-            print(f"[controller] compress done ({tarball_mb:.1f} MB, {time.time() - t0:.2f}s)")
+            mb = os.path.getsize(worker_tarball) / 1_048_576
+            print(f"[controller] worker container → {worker_tarball} "
+                  f"({mb:.1f} MB, {time.time() - t0:.2f}s)")
 
             shutil.rmtree(out, ignore_errors=True)
             for pkg_dir in pkg_dirs:
                 shutil.rmtree(os.path.dirname(pkg_dir), ignore_errors=True)
-            print(f"[controller] unified container → {tarball}")
-            print(f"[controller] replay: sciunit-swarm repeat "
-                  f"--controller-ip {self.host} "
-                  f"--controller-port {self.port} {workflow_id}")
         else:
-            print("[controller] no containers collected")
+            print("[controller] no worker containers collected")
+
+        manager_tarball = os.path.join(self.output_dir, workflow_id, 'manager.tar.gz')
+        t0 = time.time()
+        with tarfile.open(manager_tarball, 'w:gz') as t:
+            t.add(mgr_pkg_dir, arcname='cde-package')
+        mb = os.path.getsize(manager_tarball) / 1_048_576
+        print(f"[controller] manager container → {manager_tarball} "
+              f"({mb:.1f} MB, {time.time() - t0:.2f}s)")
+        shutil.rmtree(mgr_work_dir, ignore_errors=True)
+
+        print(f"[controller] replay:")
+        print(f"  sciunit-swarm controller repeat {workflow_id} "
+              f"--port {self.port} --output {self.output_dir}")
+        print(f"  sciunit-swarm repeat "
+              f"--controller-ip {self.host} "
+              f"--controller-port {self.port} {workflow_id}")
+
+    # ------------------------------------------------------------------
+    # Repeat phase
+    # ------------------------------------------------------------------
+
+    def repeat(self):
+        workflow_id = self.workflow_id
+        print(f"[controller] repeat workflow_id = {workflow_id}")
+        print(f"[controller] listening port     = {self.port}")
+
+        worker_tarball  = os.path.join(self.output_dir, workflow_id, 'worker.tar.gz')
+        manager_tarball = os.path.join(self.output_dir, workflow_id, 'manager.tar.gz')
+
+        for path, label in ((worker_tarball, 'worker'), (manager_tarball, 'manager')):
+            if not os.path.isfile(path):
+                print(f"[controller] {label}.tar.gz not found at {path}")
+                return
+
+        reg_thread = threading.Thread(target=self._registry_server, daemon=True)
+        reg_thread.start()
+
+        self._run_manager_replay()
+
+        self.stop_event.set()
+        self._kill_and_collect(workflow_id)
+
+    # ------------------------------------------------------------------
+    # Manager helpers
+    # ------------------------------------------------------------------
+
+    def _run_manager_captured(self):
+        work_dir   = tempfile.mkdtemp(prefix='swarm_mgr_exec_')
+        pkg_dir    = os.path.join(work_dir, 'cde-package')
+        invoke_dir = os.getcwd()
+        os.makedirs(pkg_dir, exist_ok=True)
+
+        with open(os.path.join(pkg_dir, 'swarm.cmd'), 'w') as f:
+            json.dump({'cmd': shlex.split(self.manager_cmd), 'cwd': invoke_dir}, f)
+
+        env = os.environ.copy()
+        env['MANAGER_HOST'] = self.host
+
+        ptu_cmd = f"{self.ptu_bin} -o {pkg_dir} -- {self.manager_cmd}"
+        print(f"[controller] manager (PTU): {ptu_cmd}")
+        proc = subprocess.run(shlex.split(ptu_cmd), env=env, cwd=invoke_dir)
+        print(f"[controller] manager exited (code {proc.returncode})")
+        return work_dir, pkg_dir
+
+    def _run_manager_replay(self):
+        work_dir        = tempfile.mkdtemp(prefix='swarm_mgr_repeat_')
+        manager_tarball = os.path.join(self.output_dir, self.workflow_id, 'manager.tar.gz')
+
+        with tarfile.open(manager_tarball, 'r:gz') as t:
+            t.extractall(work_dir)
+
+        pkg_dir   = os.path.join(work_dir, 'cde-package')
+        cde_exec  = os.path.join(pkg_dir, 'cde-exec')
+        cde_root  = os.path.join(pkg_dir, 'cde-root')
+        swarm_cmd = os.path.join(pkg_dir, 'swarm.cmd')
+
+        if not os.path.exists(swarm_cmd):
+            print(f"[controller] no swarm.cmd in manager package")
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return
+        if not os.path.exists(cde_exec):
+            print(f"[controller] no cde-exec in manager package")
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return
+
+        with open(swarm_cmd) as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            orig       = data['cmd']
+            replay_cwd = data.get('cwd', cde_root)
+        else:
+            orig       = data          # backward compat: old format was bare list
+            replay_cwd = cde_root
+
+        args = orig[:1] + self.repeat_args if self.repeat_args else orig
+        cmd  = [cde_exec, '-o', pkg_dir, '--'] + args
+
+        env = os.environ.copy()
+        env['MANAGER_HOST'] = self.host
+
+        print(f"[controller] manager replay: {shlex.join(cmd)}")
+        print(f"[controller] manager cwd:    {replay_cwd}")
+        proc = subprocess.run(cmd, cwd=replay_cwd, env=env)
+        print(f"[controller] manager exited (code {proc.returncode})")
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # Registry server
@@ -123,9 +241,9 @@ class Controller:
         port        = msg['port']
         print(f"[controller] repeat worker {node_id} registered (workflow={workflow_id})")
 
-        tarball = os.path.join(self.output_dir, workflow_id, 'unified.tar.gz')
+        tarball = os.path.join(self.output_dir, workflow_id, 'worker.tar.gz')
         if not os.path.isfile(tarball):
-            print(f"[controller] workflow {workflow_id} not found")
+            print(f"[controller] worker.tar.gz not found for {workflow_id}")
             conn.close()
             return
 
@@ -136,22 +254,11 @@ class Controller:
         send_json(conn, {'type': 'CONTAINER', 'size': len(payload)})
         conn.sendall(payload)
         conn.close()
-        elapsed = time.time() - t0
-        print(f"[controller] sent container to repeat worker {node_id} "
-              f"({len(payload)} B, {elapsed:.2f}s)")
+        print(f"[controller] sent worker container to {node_id} "
+              f"({len(payload)} B, {time.time() - t0:.2f}s)")
 
         with self.workers_lock:
             self.repeat_workers[node_id] = (host, port)
-
-    # ------------------------------------------------------------------
-    # Manager
-    # ------------------------------------------------------------------
-
-    def _run_manager(self):
-        env = os.environ.copy()
-        env['MANAGER_HOST'] = self.host
-        proc = subprocess.run(self.manager_cmd, shell=True, env=env)
-        print(f"[controller] manager exited (code {proc.returncode})")
 
     # ------------------------------------------------------------------
     # Kill + collect
@@ -159,7 +266,7 @@ class Controller:
 
     def _kill_and_collect(self, workflow_id):
         os.makedirs(self.output_dir, exist_ok=True)
-        pkg_dirs = []
+        pkg_dirs      = []
         pkg_dirs_lock = threading.Lock()
 
         with self.workers_lock:
@@ -200,15 +307,14 @@ class Controller:
                 try:
                     conn, _ = collect_srv.accept()
                     conn.settimeout(None)
-                    t0 = time.time()
+                    t0  = time.time()
                     msg = recv_json(conn)
                     assert msg['type'] == 'CONTAINER'
                     node_id = msg['node_id']
                     payload = recv_exact(conn, msg['size'])
                     conn.close()
-                    elapsed = time.time() - t0
                     print(f"[controller] received container from {node_id} "
-                          f"({len(payload)} B, {elapsed:.2f}s)")
+                          f"({len(payload)} B, {time.time() - t0:.2f}s)")
 
                     dest = os.path.join(self.output_dir, workflow_id, f'worker_{node_id}')
                     os.makedirs(dest, exist_ok=True)
